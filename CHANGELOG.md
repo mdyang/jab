@@ -1,3 +1,6 @@
+## 0.12.0
+- Add suffix to member name for interfaces with the same name from different namespaces to resolve conflict (https://github.com/pakrym/jab/pull/187).
+
 ## 0.11.0
 - Factory-created services are now correctly disposed (https://github.com/pakrym/jab/pull/179).
 
