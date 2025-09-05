@@ -1,10 +1,11 @@
 #nullable enable
+using Jab;
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using Xunit;
-
-using Jab;
 
 namespace JabTests
 {
@@ -1448,6 +1449,36 @@ namespace JabTests
         internal partial class SupportsNoneTransientValueTypeContainer
         {
         }
+
+
+        [Fact]
+        public void GeneratesDistinctMembersForSameLocalNameAcrossNamespaces()
+        {
+            var c = new NameCollisionContainer();
+
+            var foo1 = c.GetService<IService>();
+            var foo2 = c.GetService<NestedNS.IService>();
+
+            Assert.NotNull(foo1);
+            Assert.NotNull(foo2);
+            Assert.NotSame(foo1, foo2);
+
+            // Verify distinct private cache fields were generated (e.g. _IFoo_0, _IFoo_1)
+            var fields = typeof(NameCollisionContainer)
+                .GetFields(BindingFlags.Instance | BindingFlags.NonPublic)
+                .Where(f => f.Name.StartsWith("_IService", StringComparison.Ordinal))
+                .Select(f => f.Name)
+                .Distinct()
+                .ToArray();
+
+            Assert.Equal(2, fields.Length);
+            Assert.NotEqual(fields[0], fields[1]);
+        }
+
+        [ServiceProvider]
+        [Singleton(typeof(IService), typeof(ServiceImplementation))]
+        [Singleton(typeof(NestedNS.IService), typeof(NestedNS.ServiceImplementation))]
+        internal partial class NameCollisionContainer { }
     }
 }
 

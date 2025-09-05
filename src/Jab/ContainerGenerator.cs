@@ -1,5 +1,7 @@
 ﻿namespace Jab;
 
+using System.Linq;
+
 [Generator]
 #pragma warning disable RS1001 // We don't want this to be discovered as analyzer but it simplifies testing
 public partial class ContainerGenerator : DiagnosticAnalyzer
@@ -7,6 +9,9 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 {
     /// <summary>Code for a [GeneratedCode] attribute to put on the top-level generated members.</summary>
     private static readonly string _generatedCodeAttribute = $"[global::System.CodeDom.Compiler.GeneratedCodeAttribute(\"{typeof(ContainerGenerator).Assembly.GetName().Name}\", \"{typeof(ContainerGenerator).Assembly.GetName().Version}\")]";
+
+    // per-execution mapping from concrete type symbol to its (possibly suffixed) base name
+    private Dictionary<INamedTypeSymbol, string>? _typeBaseNameMap;
 
     private void GenerateCallSiteWithCache(CodeWriter codeWriter, string rootReference, ServiceCallSite serviceCallSite, Action<CodeWriter, CodeWriterDelegate> valueCallback)
     {
@@ -192,6 +197,9 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         {
             var roots = new ServiceProviderBuilder(context).BuildRoots();
 
+            // Pre-compute unique base names for all service types across all roots
+            _typeBaseNameMap = BuildTypeBaseNameMap(roots);
+
             foreach (var root in roots)
             {
                 var codeWriter = new CodeWriter();
@@ -351,11 +359,90 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                 }
                 context.AddSource($"{root.Type.Name}.Generated.cs", codeWriter.ToString());
             }
+
+            _typeBaseNameMap = null; // cleanup
         }
         catch (Exception e)
         {
             context.ReportDiagnostic(Diagnostic.Create(DiagnosticDescriptors.UnexpectedErrorDescriptor, Location.None, e.ToString().Replace(Environment.NewLine, " ")));
         }
+    }
+
+    private Dictionary<INamedTypeSymbol, string> BuildTypeBaseNameMap(IEnumerable<ServiceProvider> roots)
+    {
+        var allTypes = new HashSet<INamedTypeSymbol>(SymbolEqualityComparer.Default);
+
+        foreach (var r in roots)
+        {
+            foreach (var cs in r.RootCallSites)
+            {
+                if (cs.Identity.Type is INamedTypeSymbol nts)
+                {
+                    allTypes.Add(nts);
+                }
+            }
+        }
+
+        // Group by raw base name
+        var groups = new Dictionary<string, List<INamedTypeSymbol>>(StringComparer.Ordinal);
+        foreach (var t in allTypes)
+        {
+            var baseName = BuildRawBaseName(t);
+            if (!groups.TryGetValue(baseName, out var list))
+            {
+                list = new List<INamedTypeSymbol>();
+                groups[baseName] = list;
+            }
+            list.Add(t);
+        }
+
+        var result = new Dictionary<INamedTypeSymbol, string>(SymbolEqualityComparer.Default);
+
+        foreach (var kvp in groups)
+        {
+            var baseName = kvp.Key;
+            var list = kvp.Value;
+
+            if (list.Count == 1)
+            {
+                result[list[0]] = baseName;
+            }
+            else
+            {
+                // Stable ordering by fully-qualified name
+                var ordered = list
+                    .OrderBy(t => t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), StringComparer.Ordinal)
+                    .ToList();
+
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    result[ordered[i]] = baseName + "_" + i;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static string BuildRawBaseName(INamedTypeSymbol symbol)
+    {
+        var sb = new StringBuilder();
+
+        void Traverse(ITypeSymbol s)
+        {
+            sb.Append(s.Name);
+            if (s is INamedTypeSymbol { IsGenericType: true } g)
+            {
+                sb.Append("_");
+                foreach (var ta in g.TypeArguments)
+                {
+                    Traverse(ta);
+                }
+            }
+        }
+
+        Traverse(symbol);
+        return sb.ToString();
     }
 
     private IEnumerable<IGrouping<ITypeSymbol, ServiceCallSite>> GroupNamedServices(ServiceProvider root)
@@ -364,6 +451,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             .Where(static s => s.Identity.IsMainNamedImplementation)
             .GroupBy<ServiceCallSite, ITypeSymbol>(static s => s.Identity.Type, SymbolEqualityComparer.Default);
     }
+
     private void WriteNamedServiceProvider(CodeWriter codeWriter, ServiceProvider root)
     {
         foreach (var serviceGroup in GroupNamedServices(root))
@@ -408,7 +496,6 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 
         WriteKeyedServiceProvider(codeWriter, root);
     }
-
 
     private void WriteKeyedServiceProvider(CodeWriter codeWriter, ServiceProvider root)
     {
@@ -549,7 +636,6 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             }
         }
 
-
         codeWriter.Line();
     }
 
@@ -638,22 +724,20 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 
     private string GetServiceExpandedName(ServiceIdentity identity)
     {
-        StringBuilder builder = new();
+        var typeSymbol = (INamedTypeSymbol)identity.Type;
+        string baseName;
 
-        void Traverse(ITypeSymbol symbol)
+        if (_typeBaseNameMap != null && _typeBaseNameMap.TryGetValue(typeSymbol, out var mapped))
         {
-            builder.Append(symbol.Name);
-            if (symbol is INamedTypeSymbol { IsGenericType: true } genericType)
-            {
-                builder.Append("_");
-                foreach (var typeArgument in genericType.TypeArguments)
-                {
-                    Traverse(typeArgument);
-                }
-            }
+            baseName = mapped;
+        }
+        else
+        {
+            // Fallback (should not normally happen)
+            baseName = BuildRawBaseName(typeSymbol);
         }
 
-        Traverse(identity.Type);
+        var builder = new StringBuilder(baseName);
 
         if (identity.Name != null)
         {
@@ -666,6 +750,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             builder.Append("_");
             builder.Append(identity.ReverseIndex);
         }
+
         return builder.ToString();
     }
 
