@@ -10,10 +10,12 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
     /// <summary>Code for a [GeneratedCode] attribute to put on the top-level generated members.</summary>
     private static readonly string _generatedCodeAttribute = $"[global::System.CodeDom.Compiler.GeneratedCodeAttribute(\"{typeof(ContainerGenerator).Assembly.GetName().Name}\", \"{typeof(ContainerGenerator).Assembly.GetName().Version}\")]";
 
-    // per-execution mapping from concrete type symbol to its (possibly suffixed) base name
-    private Dictionary<INamedTypeSymbol, string>? _typeBaseNameMap;
-
-    private void GenerateCallSiteWithCache(CodeWriter codeWriter, string rootReference, ServiceCallSite serviceCallSite, Action<CodeWriter, CodeWriterDelegate> valueCallback)
+    private void GenerateCallSiteWithCache(
+        CodeWriter codeWriter,
+        string rootReference,
+        ServiceCallSite serviceCallSite,
+        Action<CodeWriter, CodeWriterDelegate> valueCallback,
+        Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         if (serviceCallSite is ErrorCallSite errorCallSite)
         {
@@ -28,7 +30,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 
         if (serviceCallSite.Lifetime != ServiceLifetime.Transient)
         {
-            var cacheLocation = GetCacheLocation(serviceCallSite.Identity);
+            var cacheLocation = GetCacheLocation(serviceCallSite.Identity, typeBaseNameMap);
             codeWriter.Line($"if ({cacheLocation} == null)");
             codeWriter.Line($"lock (this)");
             using (codeWriter.Scope($"if ({cacheLocation} == null)"))
@@ -40,7 +42,8 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     (w, v) =>
                     {
                         w.Line($"{cacheLocation} = {v};");
-                    });
+                    },
+                    typeBaseNameMap);
             }
 
             if (serviceCallSite.ImplementationType.IsValueType)
@@ -57,17 +60,17 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             GenerateCallSite(codeWriter, rootReference, serviceCallSite, (w, v) =>
             {
                 w.Line($"{serviceCallSite.ImplementationType} service = {v};");
-            });
+            }, typeBaseNameMap);
             codeWriter.Line($"TryAddDisposable(service);");
             valueCallback(codeWriter, w => w.Append($"service"));
         }
         else
         {
-            GenerateCallSite(codeWriter, rootReference, serviceCallSite, valueCallback);
+            GenerateCallSite(codeWriter, rootReference, serviceCallSite, valueCallback, typeBaseNameMap);
         }
     }
 
-    private void WriteResolutionCall(CodeWriter codeWriter, ServiceIdentity other, string reference)
+    private void WriteResolutionCall(CodeWriter codeWriter, ServiceIdentity other, string reference, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         if (other.IsMainImplementation)
         {
@@ -75,7 +78,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         }
         else
         {
-            codeWriter.Append($"{reference}.{GetResolutionServiceName(other)}()");
+            codeWriter.Append($"{reference}.{GetResolutionServiceName(other, typeBaseNameMap)}()");
         }
     }
 
@@ -122,24 +125,33 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         }
     }
 
-    private void AppendParameters(CodeWriter codeWriter, ServiceCallSite[] parameters, KeyValuePair<IParameterSymbol, ServiceCallSite>[] optionalParameters)
+    private void AppendParameters(
+        CodeWriter codeWriter,
+        ServiceCallSite[] parameters,
+        KeyValuePair<IParameterSymbol, ServiceCallSite>[] optionalParameters,
+        Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         foreach (var parameter in parameters)
         {
-            WriteResolutionCall(codeWriter, parameter.Identity, "this");
+            WriteResolutionCall(codeWriter, parameter.Identity, "this", typeBaseNameMap);
             codeWriter.AppendRaw(", ");
         }
 
         foreach (var pair in optionalParameters)
         {
             codeWriter.Append($"{pair.Key.Name}: ");
-            WriteResolutionCall(codeWriter, pair.Value.Identity, "this");
+            WriteResolutionCall(codeWriter, pair.Value.Identity, "this", typeBaseNameMap);
             codeWriter.AppendRaw(", ");
         }
         codeWriter.RemoveTrailingComma();
     }
 
-    private void GenerateCallSite(CodeWriter codeWriter, string rootReference, ServiceCallSite serviceCallSite, Action<CodeWriter, CodeWriterDelegate> valueCallback)
+    private void GenerateCallSite(
+        CodeWriter codeWriter,
+        string rootReference,
+        ServiceCallSite serviceCallSite,
+        Action<CodeWriter, CodeWriterDelegate> valueCallback,
+        Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         switch (serviceCallSite)
         {
@@ -147,7 +159,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                 valueCallback(codeWriter, w =>
                 {
                     w.Append($"new {transientCallSite.ImplementationType}(");
-                    AppendParameters(w, transientCallSite.Parameters, transientCallSite.OptionalParameters);
+                    AppendParameters(w, transientCallSite.Parameters, transientCallSite.OptionalParameters, typeBaseNameMap);
                     w.Append($")");
                 });
                 break;
@@ -164,7 +176,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     AppendMemberGenericParameters(w, methodCallSite.Member);
 
                     w.AppendRaw("(");
-                    AppendParameters(w, methodCallSite.Parameters, methodCallSite.OptionalParameters);
+                    AppendParameters(w, methodCallSite.Parameters, methodCallSite.OptionalParameters, typeBaseNameMap);
                     w.Append($")");
                 });
                 break;
@@ -175,7 +187,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     {
                         foreach (var item in arrayServiceCallSite.Items)
                         {
-                            WriteResolutionCall(codeWriter, item.Identity, "this");
+                            WriteResolutionCall(codeWriter, item.Identity, "this", typeBaseNameMap);
                             w.LineRaw(", ");
                         }
                     }
@@ -198,7 +210,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             var roots = new ServiceProviderBuilder(context).BuildRoots();
 
             // Pre-compute unique base names for all service types across all roots
-            _typeBaseNameMap = BuildTypeBaseNameMap(roots);
+            var typeBaseNameMap = BuildTypeBaseNameMap(roots);
 
             foreach (var root in roots)
             {
@@ -223,7 +235,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     using (codeWriter.Scope())
                     {
                         codeWriter.Line($"private Scope? _rootScope;");
-                        WriteCacheLocations(root, codeWriter, isScope: false);
+                        WriteCacheLocations(root, codeWriter, isScope: false, typeBaseNameMap);
 
                         foreach (var rootService in root.RootCallSites)
                         {
@@ -234,7 +246,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                             }
                             else
                             {
-                                codeWriter.Append($"private {rootServiceType} {GetResolutionServiceName(rootService.Identity)}()");
+                                codeWriter.Append($"private {rootServiceType} {GetResolutionServiceName(rootService.Identity, typeBaseNameMap)}()");
                             }
 
                             if (rootService.Lifetime == ServiceLifetime.Scoped)
@@ -249,16 +261,17 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                                     GenerateCallSiteWithCache(codeWriter,
                                         "this",
                                         rootService,
-                                        (w, v) => w.Line($"return {v};"));
+                                        (w, v) => w.Line($"return {v};"),
+                                        typeBaseNameMap);
                                 }
                             }
 
                             codeWriter.Line();
                         }
 
-                        WriteNamedServiceProvider(codeWriter, root);
-                        WriteServiceProvider(codeWriter, root);
-                        WriteDispose(codeWriter, root, isScoped: false);
+                        WriteNamedServiceProvider(codeWriter, root, typeBaseNameMap);
+                        WriteServiceProvider(codeWriter, root, typeBaseNameMap);
+                        WriteDispose(codeWriter, root, isScoped: false, typeBaseNameMap);
                         WritePublicGetServiceMethods(codeWriter);
 
                         codeWriter.Line($"public Scope CreateScope() => new Scope(this);");
@@ -297,7 +310,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                         WriteInterfaces(codeWriter, root, true);
                         using (codeWriter.Scope())
                         {
-                            WriteCacheLocations(root, codeWriter, isScope: true);
+                            WriteCacheLocations(root, codeWriter, isScope: true, typeBaseNameMap);
                             codeWriter.Line($"private {root.Type} _root;");
                             codeWriter.Line();
 
@@ -315,12 +328,12 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 
                                 using (rootService.Identity.IsMainImplementation ?
                                            codeWriter.Scope($"{rootServiceType} IServiceProvider<{rootServiceType}>.GetService()") :
-                                           codeWriter.Scope($"private {rootServiceType} {GetResolutionServiceName(rootService.Identity)}()"))
+                                           codeWriter.Scope($"private {rootServiceType} {GetResolutionServiceName(rootService.Identity, typeBaseNameMap)}()"))
                                 {
                                     if (rootService.Lifetime == ServiceLifetime.Singleton)
                                     {
                                         codeWriter.Append($"return ");
-                                        WriteResolutionCall(codeWriter, rootService.Identity, "_root");
+                                        WriteResolutionCall(codeWriter, rootService.Identity, "_root", typeBaseNameMap);
                                         codeWriter.Line($";");
                                     }
                                     else
@@ -328,21 +341,22 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                                         GenerateCallSiteWithCache(codeWriter,
                                             "_root",
                                             rootService,
-                                            (w, v) => w.Line($"return {v};"));
+                                            (w, v) => w.Line($"return {v};"),
+                                            typeBaseNameMap);
                                     }
                                 }
                                 codeWriter.Line();
                             }
 
-                            WriteServiceProvider(codeWriter, root);
-                            WriteNamedServiceProvider(codeWriter, root);
+                            WriteServiceProvider(codeWriter, root, typeBaseNameMap);
+                            WriteNamedServiceProvider(codeWriter, root, typeBaseNameMap);
 
                             if (root.KnownTypes.IServiceScopeType != null)
                             {
                                 codeWriter.Line($"{root.KnownTypes.IServiceProviderType} {root.KnownTypes.IServiceScopeType}.ServiceProvider => this;");
                                 codeWriter.Line();
                             }
-                            WriteDispose(codeWriter, root, isScoped: true);
+                            WriteDispose(codeWriter, root, isScoped: true, typeBaseNameMap);
                         }
 
                         using (codeWriter.Scope($"private Scope GetRootScope()"))
@@ -359,8 +373,6 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                 }
                 context.AddSource($"{root.Type.Name}.Generated.cs", codeWriter.ToString());
             }
-
-            _typeBaseNameMap = null; // cleanup
         }
         catch (Exception e)
         {
@@ -409,7 +421,6 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             }
             else
             {
-                // Stable ordering by fully-qualified name
                 var ordered = list
                     .OrderBy(t => t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), StringComparer.Ordinal)
                     .ToList();
@@ -452,7 +463,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
             .GroupBy<ServiceCallSite, ITypeSymbol>(static s => s.Identity.Type, SymbolEqualityComparer.Default);
     }
 
-    private void WriteNamedServiceProvider(CodeWriter codeWriter, ServiceProvider root)
+    private void WriteNamedServiceProvider(CodeWriter codeWriter, ServiceProvider root, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         foreach (var serviceGroup in GroupNamedServices(root))
         {
@@ -464,7 +475,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     foreach (var callSite in serviceGroup)
                     {
                         codeWriter.Append($"case \"{callSite.Identity.Name}\": return ");
-                        WriteResolutionCall(codeWriter, callSite.Identity, "this");
+                        WriteResolutionCall(codeWriter, callSite.Identity, "this", typeBaseNameMap);
                         codeWriter.Line($";");
                     }
 
@@ -475,7 +486,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         }
     }
 
-    private void WriteServiceProvider(CodeWriter codeWriter, ServiceProvider root)
+    private void WriteServiceProvider(CodeWriter codeWriter, ServiceProvider root, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         using (codeWriter.Scope($"{typeof(object)}? {typeof(IServiceProvider)}.GetService({typeof(Type)} type)"))
         {
@@ -484,7 +495,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                 if (rootRootCallSite.Identity.IsMainImplementation)
                 {
                     codeWriter.Append($"if (type == typeof({rootRootCallSite.Identity.Type})) return ");
-                    WriteResolutionCall(codeWriter, rootRootCallSite.Identity, "this");
+                    WriteResolutionCall(codeWriter, rootRootCallSite.Identity, "this", typeBaseNameMap);
                     codeWriter.Line($";");
                 }
             }
@@ -494,10 +505,10 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
 
         codeWriter.Line();
 
-        WriteKeyedServiceProvider(codeWriter, root);
+        WriteKeyedServiceProvider(codeWriter, root, typeBaseNameMap);
     }
 
-    private void WriteKeyedServiceProvider(CodeWriter codeWriter, ServiceProvider root)
+    private void WriteKeyedServiceProvider(CodeWriter codeWriter, ServiceProvider root, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         var iface = root.KnownTypes.IKeyedServiceProviderType;
         if (iface == null)
@@ -517,7 +528,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                         foreach (var callSite in serviceGroup)
                         {
                             codeWriter.Append($"case \"{callSite.Identity.Name}\": return ");
-                            WriteResolutionCall(codeWriter, callSite.Identity, "this");
+                            WriteResolutionCall(codeWriter, callSite.Identity, "this", typeBaseNameMap);
                             codeWriter.Line($";");
                         }
                     }
@@ -546,7 +557,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         codeWriter.Line();
     }
 
-    private void WriteDispose(CodeWriter codeWriter, ServiceProvider root, bool isScoped)
+    private void WriteDispose(CodeWriter codeWriter, ServiceProvider root, bool isScoped, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         codeWriter.Line($"private {typeof(List<object>)}? _disposables;");
         codeWriter.Line();
@@ -578,7 +589,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                     (rootService.Lifetime == ServiceLifetime.Scoped && !isScoped) ||
                     rootService.Lifetime == ServiceLifetime.Transient) continue;
 
-                codeWriter.Line($"TryDispose({GetCacheLocation(rootService.Identity)});");
+                codeWriter.Line($"TryDispose({GetCacheLocation(rootService.Identity, typeBaseNameMap)});");
             }
 
             if (!isScoped)
@@ -620,7 +631,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                         (rootService.Lifetime == ServiceLifetime.Scoped && !isScoped) ||
                         rootService.Lifetime == ServiceLifetime.Transient) continue;
 
-                    codeWriter.Line($"await TryDispose({GetCacheLocation(rootService.Identity)});");
+                    codeWriter.Line($"await TryDispose({GetCacheLocation(rootService.Identity, typeBaseNameMap)});");
                 }
 
                 if (!isScoped)
@@ -694,7 +705,7 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
         codeWriter.Line();
     }
 
-    private void WriteCacheLocations(ServiceProvider root, CodeWriter codeWriter, bool isScope)
+    private void WriteCacheLocations(ServiceProvider root, CodeWriter codeWriter, bool isScope, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         foreach (var rootService in root.RootCallSites)
         {
@@ -702,38 +713,37 @@ public partial class ContainerGenerator : DiagnosticAnalyzer
                 (rootService.Lifetime == ServiceLifetime.Scoped && !isScope) ||
                 rootService.Lifetime == ServiceLifetime.Transient) continue;
 
-            codeWriter.Line($"private {rootService.ImplementationType}? {GetCacheLocation(rootService.Identity)};");
+            codeWriter.Line($"private {rootService.ImplementationType}? {GetCacheLocation(rootService.Identity, typeBaseNameMap)};");
         }
         codeWriter.Line();
     }
 
-    private string GetResolutionServiceName(ServiceIdentity identity)
+    private string GetResolutionServiceName(ServiceIdentity identity, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         if (!identity.IsMainImplementation)
         {
-            return $"Get{GetServiceExpandedName(identity)}";
+            return $"Get{GetServiceExpandedName(identity, typeBaseNameMap)}";
         }
 
         throw new InvalidOperationException("Main implementation should be resolved via GetService<T> call");
     }
 
-    private string GetCacheLocation(ServiceIdentity identity)
+    private string GetCacheLocation(ServiceIdentity identity, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
-        return $"_{GetServiceExpandedName(identity)}";
+        return $"_{GetServiceExpandedName(identity, typeBaseNameMap)}";
     }
 
-    private string GetServiceExpandedName(ServiceIdentity identity)
+    private string GetServiceExpandedName(ServiceIdentity identity, Dictionary<INamedTypeSymbol, string> typeBaseNameMap)
     {
         var typeSymbol = (INamedTypeSymbol)identity.Type;
         string baseName;
 
-        if (_typeBaseNameMap != null && _typeBaseNameMap.TryGetValue(typeSymbol, out var mapped))
+        if (typeBaseNameMap.TryGetValue(typeSymbol, out var mapped))
         {
             baseName = mapped;
         }
         else
         {
-            // Fallback (should not normally happen)
             baseName = BuildRawBaseName(typeSymbol);
         }
 
